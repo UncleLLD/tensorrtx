@@ -15,10 +15,13 @@ import pycuda.driver as cuda
 import tensorrt as trt
 import torch
 import torchvision
+import re
+from PIL import Image, ImageDraw, ImageFont
+
 
 CONF_THRESH = 0.5
 IOU_THRESHOLD = 0.4
-
+ZH_PATTERN = re.compile(u'[\u4e00-\u9fa5]+')
 
 def get_img_path_batches(batch_size, img_dir):
     ret = []
@@ -37,14 +40,14 @@ def plot_one_box(x, img, color=None, label=None, line_thickness=None):
     """
     description: Plots one bounding box on image img,
                  this function comes from YoLov5 project.
-    param: 
+    param:
         x:      a box likes [x1,y1,x2,y2]
         img:    a opencv image object
         color:  color to draw rectangle, such as (0,255,0)
         label:  str
         line_thickness: int
     return:
-        no return
+        return plot image
 
     """
     tl = (
@@ -52,22 +55,35 @@ def plot_one_box(x, img, color=None, label=None, line_thickness=None):
     )  # line/font thickness
     color = color or [random.randint(0, 255) for _ in range(3)]
     c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
-    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)  # plot detect box
+    tf = max(tl - 1, 1)  # font thickness
+    t_size = cv2.getTextSize(label, 0, fontScale=tl/3, thickness=tf)[0]
+    c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
     if label:
-        tf = max(tl - 1, 1)  # font thickness
-        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
-        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
-        cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
-        cv2.putText(
-            img,
-            label,
-            (c1[0], c1[1] - 2),
-            0,
-            tl / 3,
-            [225, 255, 255],
-            thickness=tf,
-            lineType=cv2.LINE_AA,
-        )
+        if not ZH_PATTERN.search(label):  # no chinese char in label
+            cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
+            cv2.putText(
+                img,
+                label,
+                (c1[0], c1[1] - 2),
+                0,
+                tl / 3,
+                [225, 255, 255],
+                thickness=tf,
+                lineType=cv2.LINE_AA,
+            )
+        else:
+            image = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(image)
+            font = ImageFont.truetype("/font/simsun.ttc", 25, encoding="unic")
+            w, h = draw.textsize(label, font)
+            x1 = c1[0] + w
+            y1 = c1[1] - h - 3
+            color = tuple(color[::-1])  # PIL color is reverse with opencv
+            draw.rectangle([c1, (x1, y1)], fill=color, outline=None, width=tl)
+            draw.text((c1[0], y1), label, (255, 255, 255), font=font)
+            img = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+        return img
 
 
 class YoLov5TRT(object):
@@ -155,7 +171,8 @@ class YoLov5TRT(object):
         # Transfer input data  to the GPU.
         cuda.memcpy_htod_async(cuda_inputs[0], host_inputs[0], stream)
         # Run inference.
-        context.execute_async(batch_size=self.batch_size, bindings=bindings, stream_handle=stream.handle)
+        context.execute_async(
+            batch_size=self.batch_size, bindings=bindings, stream_handle=stream.handle)
         # Transfer predictions back from the GPU.
         cuda.memcpy_dtoh_async(host_outputs[0], cuda_outputs[0], stream)
         # Synchronize the stream
@@ -171,28 +188,30 @@ class YoLov5TRT(object):
                 output[i * 6001: (i + 1) * 6001], batch_origin_h[i], batch_origin_w[i]
             )
             # Draw rectangles and labels on the original image
+            image = batch_image_raw[i]
             for j in range(len(result_boxes)):
                 box = result_boxes[j]
-                plot_one_box(
+                image = plot_one_box(
                     box,
-                    batch_image_raw[i],
+                    image,
                     label="{}:{:.2f}".format(
                         categories[int(result_classid[j])], result_scores[j]
                     ),
                 )
+            batch_image_raw[i] = image
         return batch_image_raw, end - start
 
     def destroy(self):
         # Remove any context from the top of the context stack, deactivating it.
         self.ctx.pop()
-        
+
     def get_raw_image(self, image_path_batch):
         """
         description: Read an image from image path
         """
         for img_path in image_path_batch:
             yield cv2.imread(img_path)
-        
+
     def get_raw_image_zeros(self, image_path_batch=None):
         """
         description: Ready data for warmup
@@ -280,7 +299,7 @@ class YoLov5TRT(object):
         """
         description: postprocess the prediction
         param:
-            output:     A tensor likes [num_boxes,cx,cy,w,h,conf,cls_id, cx,cy,w,h,conf,cls_id, ...] 
+            output:     A tensor likes [num_boxes,cx,cy,w,h,conf,cls_id, cx,cy,w,h,conf,cls_id, ...]
             origin_h:   height of original image
             origin_w:   width of original image
         return:
@@ -341,7 +360,6 @@ class warmUpThread(threading.Thread):
         print('warm_up->{}, time->{:.2f}ms'.format(batch_image_raw[0].shape, use_time * 1000))
 
 
-
 if __name__ == "__main__":
     # load custom plugins
     PLUGIN_LIBRARY = "build/libmyplugins.so"
@@ -355,16 +373,17 @@ if __name__ == "__main__":
     ctypes.CDLL(PLUGIN_LIBRARY)
 
     # load coco labels
-
-    categories = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
-            "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-            "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-            "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
-            "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-            "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-            "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
-            "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
-            "hair drier", "toothbrush"]
+    categories = [
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+        "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+        "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+        "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+        "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+        "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake",
+        "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop",
+        "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+        "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]
 
     if os.path.exists('output/'):
         shutil.rmtree('output/')
@@ -373,7 +392,6 @@ if __name__ == "__main__":
     yolov5_wrapper = YoLov5TRT(engine_file_path)
     try:
         print('batch size is', yolov5_wrapper.batch_size)
-        
         image_dir = "samples/"
         image_path_batches = get_img_path_batches(yolov5_wrapper.batch_size, image_dir)
 
